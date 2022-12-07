@@ -274,3 +274,35 @@ def get_hyper_enc_dec_models(y_channel, z_channel):
     )
 
     return enc, dec
+
+
+class DQ_ResBlock(nn.Sequential):
+    def __init__(self, num_filters):
+        super().__init__(
+            nn.Conv2d(num_filters, num_filters, 3, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(num_filters, num_filters, 3, padding=1)
+        )
+
+    def forward(self, input):
+        return super().forward(input) + input
+
+
+class DeQuantizationModule(nn.Module):
+
+    def __init__(self, in_channels, out_channels, num_filters, num_layers):
+        super(DeQuantizationModule, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels, num_filters, 3, padding=1)
+        self.resblock = nn.Sequential(
+            *[DQ_ResBlock(num_filters) for _ in range(num_layers)])
+        self.conv2 = nn.Conv2d(num_filters, num_filters, 3, padding=1)
+        self.conv3 = nn.Conv2d(num_filters, out_channels, 3, padding=1)
+
+    def forward(self, input):
+        conv1 = self.conv1(input)
+        x = self.resblock(conv1)
+        conv2 = self.conv2(x) + conv1
+        conv3 = self.conv3(conv2) + input
+
+        return conv3
+

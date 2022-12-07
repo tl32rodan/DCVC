@@ -8,8 +8,8 @@ from torch import nn
 
 from .common_model import CompressionModel
 from .video_net import ME_Spynet, flow_warp, ResBlock, bilineardownsacling, LowerBound, UNet, \
-    get_enc_dec_models, get_hyper_enc_dec_models
-from ..layers.layers import conv3x3, subpel_conv1x1, subpel_conv3x3
+    get_enc_dec_models, get_hyper_enc_dec_models, DeQuantizationModule
+from ..layers.layers import conv3x3, subpel_conv1x1, subpel_conv3x3, CondAugmentedNormalizedFlow
 from ..utils.stream_helper import get_downsampled_shape, encode_p, decode_p, filesize, \
     get_rounded_q, get_state_dict
 
@@ -511,3 +511,318 @@ class DMC(CompressionModel):
     def forward(self, x, dpb, mv_y_q_scale=None, y_q_scale=None):
         return self.forward_one_frame(x, dpb,
                                       mv_y_q_scale=mv_y_q_scale, y_q_scale=y_q_scale)
+
+# ---------------------------------------------------------- #
+
+class ContextualCondANFAnalysisTransform(CondAugmentedNormalizedFlow):
+    def __init__(self, channel_N=64, channel_M=96):
+        super().__init__(use_affine=False, transpose=False, distribution='gaussian')
+        self.model = ContextualEncoder(channel_N, channel_M)
+
+    def net_forward(self, input, input_cond):
+        assert isinstance(input_cond, list) and len(input_cond)==3
+
+        context1, context2, context3 = *input_cond
+
+        return self.model(input, context1, context2, context3) 
+
+
+class ContextualCondANFSynthesisTransform(CondAugmentedNormalizedFlow):
+    def __init__(self, channel_N=64, channel_M=96):
+        super().__init__(use_affine=False, transpose=True, distribution='gaussian')
+        self.model_part1 = ContextualDecoder(channel_N, channel_M)
+        self.model_part2 = ReconGeneration()
+
+    def net_forward(self, input, input_cond):
+        assert isinstance(input_cond, list) and len(input_cond)==3
+
+        context1, context2, context3 = *input_cond
+
+        recon_image_feature = self.model_part1(input, context2, context3)
+        _, recon_image = self.model_part2(recon_image_feature, context1)
+
+        return recon_image 
+
+
+class ContextualCANFMainCoder(nn.Module):
+    def __init__(self, num_layers=2, channel_N=64, channel_M=96):
+        super().__init__()
+
+        self.num_layers = num_layers
+        for i in range(num_layers):
+            self.add_module('analysis'+str(i), ContextualCondANFAnalysisTransform(channel_N, channel_M))
+            self.add_module('synthesis'+str(i), ContextualCondANFSynthesisTransform(channel_N, channel_M)
+
+    def encode(self, input, context, code=None, jac=None):
+        for i in range(self.num_layers):
+            _, code, jac = self['analysis'+str(i)](input, context, code, jac)
+
+            if i < self.num_layers-1:
+                input, _, jac = self['synthesis'+str(i)](input, context, code, jac)
+
+        return input, code, jac
+
+    def decode(self, input, context, code=None, jac=None):
+        for i in range(self.num_layers-1, -1, -1):
+            input, _, jac = self['synthesis'+str(i)](input, context, code, jac, rev=True, last_layer=i == self.num_layers-1)
+
+            if i or jac is not None:
+                _, code, jac = self['analysis'+str(i)](input, context, code, jac, rev=True)
+
+        return input, code, jac
+
+
+class CANFVC_DMC(DMC):
+    def __init__(self, anchor_num=4):
+        super().__init__(anchor_num)
+        
+        self.__delattr__('contextual_encoder')
+        self.__delattr__('contextual_decoder')
+
+        self.contextual_coder = ContextualCANFMainCoder(2, channel_N=self.channel_N, channel_M=self.channel_M)
+        self.DQ = DeQuantizationModule(3, 3, 64, 6)
+
+        self._initialize_weights()
+
+    def compress(self, x, dpb, mv_y_q_scale, y_q_scale):
+        # pic_width and pic_height may be different from x's size. x here is after padding
+        # x_hat has the same size with x
+        curr_mv_y_q = self.get_curr_mv_y_q(mv_y_q_scale)
+        curr_y_q = self.get_curr_y_q(y_q_scale)
+
+        est_mv = self.optic_flow(x, dpb["ref_frame"])
+        mv_y = self.mv_encoder(est_mv)
+        mv_y = mv_y / curr_mv_y_q
+        mv_z = self.mv_hyper_prior_encoder(mv_y)
+        mv_z_hat = torch.round(mv_z)
+        mv_params = self.mv_hyper_prior_decoder(mv_z_hat)
+        ref_mv_y = dpb["ref_mv_y"]
+        if ref_mv_y is None:
+            ref_mv_y = torch.zeros_like(mv_y)
+        mv_params = torch.cat((mv_params, ref_mv_y), dim=1)
+        mv_q_step, mv_scales, mv_means = self.mv_y_prior_fusion(mv_params).chunk(3, 1)
+        mv_y_q_w_0, mv_y_q_w_1, mv_scales_w_0, mv_scales_w_1, mv_y_hat = self.compress_dual_prior(
+            mv_y, mv_means, mv_scales, mv_q_step, self.mv_y_spatial_prior)
+        mv_y_hat = mv_y_hat * curr_mv_y_q
+
+        mv_hat = self.mv_decoder(mv_y_hat)
+        context1, context2, context3, _ = self.motion_compensation(dpb, mv_hat)
+        
+        #####################
+        #y = self.contextual_encoder(x, context1, context2, context3)
+        _, y, _ = self.contextual.encode(x, list(context1, context2, context3))
+        #####################
+        y = y / curr_y_q
+        z = self.contextual_hyper_prior_encoder(y)
+        z_hat = torch.round(z)
+        hierarchical_params = self.contextual_hyper_prior_decoder(z_hat)
+        temporal_params = self.temporal_prior_encoder(context3)
+        ref_y = dpb["ref_y"]
+        if ref_y is None:
+            ref_y = torch.zeros_like(y)
+        params = torch.cat((temporal_params, hierarchical_params, ref_y), dim=1)
+
+        q_step, scales, means = self.y_prior_fusion(params).chunk(3, 1)
+        y_q_w_0, y_q_w_1, scales_w_0, scales_w_1, y_hat = self.compress_dual_prior(
+            y, means, scales, q_step, self.y_spatial_prior)
+        y_hat = y_hat * curr_y_q
+
+        #####################
+        #recon_image_feature = self.contextual_decoder(y_hat, context2, context3)
+        #feature, x_hat = self.recon_generation_net(recon_image_feature, context1)
+        x_hat, _, _ = self.contextual_coder.decode(torch.zeros_like(dpb["ref_frame"]), , list(context1, context2, context3), y_hat)
+        x_hat = self.DQ(x_hat)
+        #####################
+
+        self.entropy_coder.reset_encoder()
+        _ = self.bit_estimator_z_mv.encode(mv_z_hat)
+        _ = self.gaussian_encoder.encode(mv_y_q_w_0, mv_scales_w_0)
+        _ = self.gaussian_encoder.encode(mv_y_q_w_1, mv_scales_w_1)
+        _ = self.bit_estimator_z.encode(z_hat)
+        _ = self.gaussian_encoder.encode(y_q_w_0, scales_w_0)
+        _ = self.gaussian_encoder.encode(y_q_w_1, scales_w_1)
+        bit_stream = self.entropy_coder.flush_encoder()
+
+        result = {
+            "dbp": {
+                "ref_frame": x_hat,
+                "ref_feature": None, #feature,
+                "ref_y": y_hat,
+                "ref_mv_y": mv_y_hat,
+            },
+            "bit_stream": bit_stream,
+        }
+        return result
+
+    def decompress(self, dpb, string, height, width,
+                   mv_y_q_scale, y_q_scale):
+        curr_mv_y_q = self.get_curr_mv_y_q(mv_y_q_scale)
+        curr_y_q = self.get_curr_y_q(y_q_scale)
+
+        self.entropy_coder.set_stream(string)
+        device = next(self.parameters()).device
+        mv_z_size = get_downsampled_shape(height, width, 64)
+        mv_z_hat = self.bit_estimator_z_mv.decode_stream(mv_z_size)
+        mv_z_hat = mv_z_hat.to(device)
+        mv_params = self.mv_hyper_prior_decoder(mv_z_hat)
+        ref_mv_y = dpb["ref_mv_y"]
+        if ref_mv_y is None:
+            _, C, H, W = mv_params.size()
+            ref_mv_y = torch.zeros((1, C // 2, H, W), device=mv_params.device)
+        mv_params = torch.cat((mv_params, ref_mv_y), dim=1)
+        mv_q_step, mv_scales, mv_means = self.mv_y_prior_fusion(mv_params).chunk(3, 1)
+        mv_y_hat = self.decompress_dual_prior(mv_means, mv_scales, mv_q_step,
+                                              self.mv_y_spatial_prior)
+        mv_y_hat = mv_y_hat * curr_mv_y_q
+
+        mv_hat = self.mv_decoder(mv_y_hat)
+        context1, context2, context3, _ = self.motion_compensation(dpb, mv_hat)
+
+        z_size = get_downsampled_shape(height, width, 64)
+        z_hat = self.bit_estimator_z.decode_stream(z_size)
+        z_hat = z_hat.to(device)
+        hierarchical_params = self.contextual_hyper_prior_decoder(z_hat)
+        temporal_params = self.temporal_prior_encoder(context3)
+        ref_y = dpb["ref_y"]
+        if ref_y is None:
+            _, C, H, W = temporal_params.size()
+            ref_y = torch.zeros((1, C // 2, H, W), device=temporal_params.device)
+        params = torch.cat((temporal_params, hierarchical_params, ref_y), dim=1)
+        q_step, scales, means = self.y_prior_fusion(params).chunk(3, 1)
+        y_hat = self.decompress_dual_prior(means, scales, q_step, self.y_spatial_prior)
+        y_hat = y_hat * curr_y_q
+
+        #####################
+        #recon_image_feature = self.contextual_decoder(y_hat, context2, context3)
+        #feature, recon_image = self.recon_generation_net(recon_image_feature, context1)
+        x_hat, _, _ = self.contextual_coder.decode(torch.zeros_like(dpb["ref_frame"]), , list(context1, context2, context3), y_hat)
+        recon_image = self.DQ(x_hat)
+        #####################
+
+        recon_image = recon_image.clamp(0, 1)
+
+        return {
+            "dpb": {
+                "ref_frame": recon_image,
+                "ref_feature": None, #feature,
+                "ref_y": y_hat,
+                "ref_mv_y": mv_y_hat,
+            },
+        }
+
+    def forward_one_frame(self, x, dpb, mv_y_q_scale=None, y_q_scale=None):
+        ref_frame = dpb["ref_frame"]
+        curr_mv_y_q = self.get_curr_mv_y_q(mv_y_q_scale)
+        curr_y_q = self.get_curr_y_q(y_q_scale)
+
+        est_mv = self.optic_flow(x, ref_frame)
+        mv_y = self.mv_encoder(est_mv)
+        mv_y = mv_y / curr_mv_y_q
+        mv_z = self.mv_hyper_prior_encoder(mv_y)
+        mv_z_hat = self.quant(mv_z)
+        mv_params = self.mv_hyper_prior_decoder(mv_z_hat)
+        ref_mv_y = dpb["ref_mv_y"]
+        if ref_mv_y is None:
+            ref_mv_y = torch.zeros_like(mv_y)
+        mv_params = torch.cat((mv_params, ref_mv_y), dim=1)
+        mv_q_step, mv_scales, mv_means = self.mv_y_prior_fusion(mv_params).chunk(3, 1)
+        mv_y_res, mv_y_q, mv_y_hat, mv_scales_hat = self.forward_dual_prior(
+            mv_y, mv_means, mv_scales, mv_q_step, self.mv_y_spatial_prior)
+        mv_y_hat = mv_y_hat * curr_mv_y_q
+
+        mv_hat = self.mv_decoder(mv_y_hat)
+        context1, context2, context3, warp_frame = self.motion_compensation(dpb, mv_hat)
+
+        #####################
+        #y = self.contextual_encoder(x, context1, context2, context3)
+        x1, y, _ = self.contextual.encode(x, list(context1, context2, context3))
+        #####################
+
+        y = y / curr_y_q
+        z = self.contextual_hyper_prior_encoder(y)
+        z_hat = self.quant(z)
+        hierarchical_params = self.contextual_hyper_prior_decoder(z_hat)
+        temporal_params = self.temporal_prior_encoder(context3)
+
+        ref_y = dpb["ref_y"]
+        if ref_y is None:
+            ref_y = torch.zeros_like(y)
+        params = torch.cat((temporal_params, hierarchical_params, ref_y), dim=1)
+        q_step, scales, means = self.y_prior_fusion(params).chunk(3, 1)
+        y_res, y_q, y_hat, scales_hat = self.forward_dual_prior(
+            y, means, scales, q_step, self.y_spatial_prior)
+        y_hat = y_hat * curr_y_q
+
+        #####################
+        #recon_image_feature = self.contextual_decoder(y_hat, context2, context3)
+        #feature, recon_image = self.recon_generation_net(recon_image_feature, context1)
+        x_hat, _, _ = self.contextual_coder.decode(torch.zeros_like(dpb["ref_frame"]), , list(context1, context2, context3), y_hat)
+        recon_image = self.DQ(x_hat)
+        #####################
+
+        B, _, H, W = x.size()
+        pixel_num = H * W
+        mse = self.mse(x, recon_image)
+        ssim = self.ssim(x, recon_image)
+        me_mse = self.mse(x, warp_frame)
+        mse = torch.sum(mse, dim=(1, 2, 3)) / pixel_num
+        me_mse = torch.sum(me_mse, dim=(1, 2, 3)) / pixel_num
+
+        #####################
+        # Last layer during forwarding
+        x2, _, _ = self.contextual['synthesis'+str(self.contextual.num_layers - 1)](
+                       x1, list(context1, context2, context3), y_hat
+                   )
+        x2_mse = self.mse(x2, torch.zeros_like(x2))
+        x2_mse = torch.sum(x2_mse, dim=(1, 2, 3)) / pixel_num
+        #####################
+
+        if self.training:
+            y_for_bit = self.add_noise(y_res)
+            mv_y_for_bit = self.add_noise(mv_y_res)
+            z_for_bit = self.add_noise(z)
+            mv_z_for_bit = self.add_noise(mv_z)
+        else:
+            y_for_bit = y_q
+            mv_y_for_bit = mv_y_q
+            z_for_bit = z_hat
+            mv_z_for_bit = mv_z_hat
+        bits_y = self.get_y_laplace_bits(y_for_bit, scales_hat)
+        bits_mv_y = self.get_y_laplace_bits(mv_y_for_bit, mv_scales_hat)
+        bits_z = self.get_z_bits(z_for_bit, self.bit_estimator_z)
+        bits_mv_z = self.get_z_bits(mv_z_for_bit, self.bit_estimator_z_mv)
+
+        bpp_y = torch.sum(bits_y, dim=(1, 2, 3)) / pixel_num
+        bpp_z = torch.sum(bits_z, dim=(1, 2, 3)) / pixel_num
+        bpp_mv_y = torch.sum(bits_mv_y, dim=(1, 2, 3)) / pixel_num
+        bpp_mv_z = torch.sum(bits_mv_z, dim=(1, 2, 3)) / pixel_num
+
+        bpp = bpp_y + bpp_z + bpp_mv_y + bpp_mv_z
+        bit = torch.sum(bpp) * pixel_num
+        bit_y = torch.sum(bpp_y) * pixel_num
+        bit_z = torch.sum(bpp_z) * pixel_num
+        bit_mv_y = torch.sum(bpp_mv_y) * pixel_num
+        bit_mv_z = torch.sum(bpp_mv_z) * pixel_num
+
+        return {"bpp_mv_y": bpp_mv_y,
+                "bpp_mv_z": bpp_mv_z,
+                "bpp_y": bpp_y,
+                "bpp_z": bpp_z,
+                "bpp": bpp,
+                "x2_mse": x2_mse,
+                "me_mse": me_mse,
+                "mse": mse,
+                "ssim": ssim,
+                "dpb": {
+                    "ref_frame": recon_image,
+                    "ref_feature": None, #feature,
+                    "ref_y": y_hat,
+                    "ref_mv_y": mv_y_hat,
+                },
+                "bit": bit,
+                "bit_y": bit_y,
+                "bit_z": bit_z,
+                "bit_mv_y": bit_mv_y,
+                "bit_mv_z": bit_mv_z,
+                }
+
