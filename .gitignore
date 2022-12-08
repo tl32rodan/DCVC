@@ -7,3 +7,4 @@ build/
 *.tar
 *.pyd
 ACMMM2022/checkpoints/**
+*.swp

@@ -824,5 +824,7 @@ class CANFVC_DMC(DMC):
                 "bit_z": bit_z,
                 "bit_mv_y": bit_mv_y,
                 "bit_mv_z": bit_mv_z,
+                "mv_hat": mv_hat,
+                "BDQ": x_hat,
                 }
 
