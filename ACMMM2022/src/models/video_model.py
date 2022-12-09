@@ -522,7 +522,7 @@ class ContextualCondANFAnalysisTransform(CondAugmentedNormalizedFlow):
     def net_forward(self, input, input_cond):
         assert isinstance(input_cond, list) and len(input_cond)==3
 
-        context1, context2, context3 = *input_cond
+        context1, context2, context3 = input_cond
 
         return self.model(input, context1, context2, context3) 
 
@@ -536,7 +536,7 @@ class ContextualCondANFSynthesisTransform(CondAugmentedNormalizedFlow):
     def net_forward(self, input, input_cond):
         assert isinstance(input_cond, list) and len(input_cond)==3
 
-        context1, context2, context3 = *input_cond
+        context1, context2, context3 = input_cond
 
         recon_image_feature = self.model_part1(input, context2, context3)
         _, recon_image = self.model_part2(recon_image_feature, context1)
@@ -551,7 +551,7 @@ class ContextualCANFMainCoder(nn.Module):
         self.num_layers = num_layers
         for i in range(num_layers):
             self.add_module('analysis'+str(i), ContextualCondANFAnalysisTransform(channel_N, channel_M))
-            self.add_module('synthesis'+str(i), ContextualCondANFSynthesisTransform(channel_N, channel_M)
+            self.add_module('synthesis'+str(i), ContextualCondANFSynthesisTransform(channel_N, channel_M))
 
     def encode(self, input, context, code=None, jac=None):
         for i in range(self.num_layers):
@@ -630,7 +630,7 @@ class CANFVC_DMC(DMC):
         #####################
         #recon_image_feature = self.contextual_decoder(y_hat, context2, context3)
         #feature, x_hat = self.recon_generation_net(recon_image_feature, context1)
-        x_hat, _, _ = self.contextual_coder.decode(torch.zeros_like(dpb["ref_frame"]), , list(context1, context2, context3), y_hat)
+        x_hat, _, _ = self.contextual_coder.decode(torch.zeros_like(dpb["ref_frame"]), list(context1, context2, context3), y_hat)
         x_hat = self.DQ(x_hat)
         #####################
 
@@ -695,7 +695,7 @@ class CANFVC_DMC(DMC):
         #####################
         #recon_image_feature = self.contextual_decoder(y_hat, context2, context3)
         #feature, recon_image = self.recon_generation_net(recon_image_feature, context1)
-        x_hat, _, _ = self.contextual_coder.decode(torch.zeros_like(dpb["ref_frame"]), , list(context1, context2, context3), y_hat)
+        x_hat, _, _ = self.contextual_coder.decode(torch.zeros_like(dpb["ref_frame"]), list(context1, context2, context3), y_hat)
         recon_image = self.DQ(x_hat)
         #####################
 
@@ -756,7 +756,7 @@ class CANFVC_DMC(DMC):
         #####################
         #recon_image_feature = self.contextual_decoder(y_hat, context2, context3)
         #feature, recon_image = self.recon_generation_net(recon_image_feature, context1)
-        x_hat, _, _ = self.contextual_coder.decode(torch.zeros_like(dpb["ref_frame"]), , list(context1, context2, context3), y_hat)
+        x_hat, _, _ = self.contextual_coder.decode(torch.zeros_like(dpb["ref_frame"]), list(context1, context2, context3), y_hat)
         recon_image = self.DQ(x_hat)
         #####################
 

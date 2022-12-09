@@ -1,8 +1,8 @@
 {
-    "root_path": "/media/data/",
+    "root_path": "/home/mapl119/dataset/TestVideo/video_dataset",
     "test_classes": {
         "HEVC_B": {
-            "test": 1,
+            "test": 0,
             "base_path": "HEVC_B",
             "src_type": "png",
             "sequences": {
@@ -14,7 +14,7 @@
             }
         },
         "HEVC_C": {
-            "test": 1,
+            "test": 0,
             "base_path": "HEVC_C",
             "src_type": "png",
             "sequences": {
@@ -25,7 +25,7 @@
             }
         },
         "HEVC_D": {
-            "test": 1,
+            "test": 0,
             "base_path": "HEVC_D",
             "src_type": "png",
             "sequences": {
@@ -36,7 +36,7 @@
             }
         },
         "HEVC_E": {
-            "test": 1,
+            "test": 0,
             "base_path": "HEVC_E",
             "src_type": "png",
             "sequences": {
@@ -46,7 +46,7 @@
             }
         },
         "HEVC_RGB": {
-            "test": 1,
+            "test": 0,
             "base_path": "HEVC_RGB",
             "src_type": "png",
             "sequences": {
@@ -60,20 +60,20 @@
         },
         "UVG": {
             "test": 1,
-            "base_path": "UVG",
+            "base_path": "U",
             "src_type": "png",
             "sequences": {
-                "Beauty_1920x1080_120fps_420_8bit_YUV":        {"width": 1920, "height": 1080, "frames": 96, "gop": 32},
-                "Bosphorus_1920x1080_120fps_420_8bit_YUV":     {"width": 1920, "height": 1080, "frames": 96, "gop": 32},
-                "HoneyBee_1920x1080_120fps_420_8bit_YUV":      {"width": 1920, "height": 1080, "frames": 96, "gop": 32},
-                "Jockey_1920x1080_120fps_420_8bit_YUV":        {"width": 1920, "height": 1080, "frames": 96, "gop": 32},
-                "ReadySteadyGo_1920x1080_120fps_420_8bit_YUV": {"width": 1920, "height": 1080, "frames": 96, "gop": 32},
-                "ShakeNDry_1920x1080_120fps_420_8bit_YUV":     {"width": 1920, "height": 1080, "frames": 96, "gop": 32},
-                "YachtRide_1920x1080_120fps_420_8bit_YUV":     {"width": 1920, "height": 1080, "frames": 96, "gop": 32}
+                "Beauty":        {"width": 1920, "height": 1080, "frames": 96, "gop": 32},
+                "Bosphorus":     {"width": 1920, "height": 1080, "frames": 96, "gop": 32},
+                "HoneyBee":      {"width": 1920, "height": 1080, "frames": 96, "gop": 32},
+                "Jockey":        {"width": 1920, "height": 1080, "frames": 96, "gop": 32},
+                "ReadySteadyGo": {"width": 1920, "height": 1080, "frames": 96, "gop": 32},
+                "ShakeNDry":     {"width": 1920, "height": 1080, "frames": 96, "gop": 32},
+                "YachtRide":     {"width": 1920, "height": 1080, "frames": 96, "gop": 32}
             }
         },
         "MCL-JCV": {
-            "test": 1,
+            "test": 0,
             "base_path": "MCL-JCV",
             "src_type": "png",
             "sequences": {
