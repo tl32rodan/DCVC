@@ -14,6 +14,7 @@ import torch.nn.functional as F
 from torchinfo import summary
 from pytorch_lightning import LightningModule
 from pytorch_lightning import Trainer, seed_everything
+from pytorch_lightning.strategies import DDPStrategy
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import CometLogger
 from torch import nn, optim
@@ -22,30 +23,51 @@ from torchvision import transforms
 from torchvision.utils import make_grid
 from pytorch_msssim import MS_SSIM
 
-from src.models.video_model import DMC, CANFVC_DMC
 from src.models.image_model import IntraNoAR
 
 from dataloader import VimeoDataset, VideoTestData
 from src.utils.psnr import mse2psnr
-from src.utils.vision import PlotFlow, PlotHeatMap, save_image
+from src.utils.stream_helper import get_padding_size, get_state_dict
+from src.utils.vision import PlotFlow, PlotHeatMap, save_image, Alignment
 
 from ptflops import get_model_complexity_info
+
 
 plot_flow = PlotFlow().cuda()
 plot_bitalloc = PlotHeatMap("RB").cuda()
 
-phase = {'trainMV': 10, 
-         'trainMC': 10,
-         'trainRes_2frames_RecOnly': 15,
-         'trainRes_2frames': 20, 
-         'trainAll_2frames': 25, 
-         'trainAll_fullgop': 30, 
-         'trainAll_RNN_1': 33, 
-         'trainAll_RNN_2': 35,
+phase = {'trainMV': -1, 
+         'trainMC': -1,
+         'trainRes_2frames_RecOnly': -1,
+         'trainRes_2frames': -1, 
+         'trainAll_2frames': -1, 
+         'trainAll_fullgop': -1, 
+         'trainAll_RNN_1': 10, 
+         'trainAll_RNN_2': 12,
          'train_aux': 100}
 
+class CompressesModel(LightningModule):
+    """Basic Compress Model"""
 
-class Pframe(LightningModule):
+    def __init__(self):
+        super(CompressesModel, self).__init__()
+
+    def named_main_parameters(self, prefix=''):
+        for name, param in self.named_parameters(prefix=prefix, recurse=True):
+            if 'quantiles' not in name:
+                yield (name, param)
+
+    def main_parameters(self):
+        for _, param in self.named_main_parameters():
+            yield param
+
+    def named_aux_parameters(self, prefix=''):
+        for name, param in self.named_parameters(prefix=prefix, recurse=True):
+            if 'quantiles' in name:
+                yield (name, param)
+
+
+class Pframe(CompressesModel):
     def __init__(self, args):
         super(Pframe, self).__init__()
         self.args = args
@@ -53,17 +75,25 @@ class Pframe(LightningModule):
 
         self.i_model = IntraNoAR()
         self.i_model.eval()
-
-        self.p_model = DMC() #CANFVC_DMC()
+        
+        if self.args.inter_coder_type == 'CVAE':
+            from src.models.video_model import DMC
+        elif self.args.inter_coder_type == 'CANF':
+            from src.models.video_model import CANFVC_DMC as DMC
+        self.p_model = DMC() 
 
         self.dpb = None
+        self.q_level = {85: 0, 170: 1, 380: 2, 840: 3}[self.args.lmda]
 
     def load_args(self, args):
         self.args = args
 
-    def forward(self, coding_frame, dpb, order=0):
+    def forward(self, coding_frame, dpb, order=0, q_level=None):
+        if q_level is None:
+            q_level = self.q_level
+
         if order == 0:
-            result = self.i_model.encode_decode(coding_frame, self.args['i_frame_q_scale'])
+            result = self.i_model.forward(coding_frame, self.i_model.q_scale[q_level:q_level+1])
             dpb = {
                 "ref_frame": result["x_hat"],
                 "ref_feature": None,
@@ -71,83 +101,127 @@ class Pframe(LightningModule):
                 "ref_mv_y": None,
             }
             recon_frame = result["x_hat"]
-            bpp = result['bpp']
+            bpp = result["bpp"]
         else:
-            result = self.p_model.encode_decode(x_padded, dpb,
-                                                mv_y_q_scale=self.args['p_frame_mv_y_q_scale'],
-                                                y_q_scale=self.args['p_frame_y_q_scale'])
+            result = self.p_model.forward_one_frame(coding_frame, dpb,
+                                                mv_y_q_scale=self.p_model.mv_y_q_scale[q_level:q_level+1],
+                                                y_q_scale=self.p_model.y_q_scale[q_level:q_level+1])
             dpb = result["dpb"]
+
+            if self.args.no_feat_buffer and dpb['ref_feature'] is not None:
+                del dpb['ref_feature'] 
+                dpb['ref_feature'] = None
+
             recon_frame = dpb["ref_frame"]
-            bpp = result['bpp']
+            bpp = result["bpp"]
          
         return recon_frame, bpp, dpb, result
 
     def training_step(self, batch, batch_idx):
+
+        def disable_modules(modules):
+            for module in modules:
+                if not isinstance(module, nn.Parameter):
+                    for param in module.parameters(): 
+                        self.optimizers().state[param] = {} # remove all state (step, exp_avg, exp_avg_sg)
+                else:
+                    self.optimizers().state[module] = {} # remove all state (step, exp_avg, exp_avg_sg)
+
+                module.requires_grad_(False)
+
+        def activate_modules(modules):
+            for module in modules:
+                module.requires_grad_(True)
+            
         epoch = self.current_epoch
-        batch = batch.cuda()
-        ref_frame = batch[:, 0]
+        if epoch <= phase['trainMV']:
+            pass
+        elif epoch <= phase['trainMC']:
+            pass
+        elif epoch <= phase['trainAll_2frames']:
+            training_frames = 2
+            if epoch <= phase['trainRes_2frames']:
+                activate_modules_list = [
+                                         #self.p_model.contextual_coder, self.p_model.DQ,
+                                         self.p_model.contextual_encoder, self.p_model.contextual_decoder,
+                                         self.p_model.contextual_hyper_prior_encoder, self.p_model.contextual_hyper_prior_decoder,
+                                         self.p_model.temporal_prior_encoder, self.p_model.y_prior_fusion, self.p_model.y_spatial_prior, 
+                                         #self.p_model.mv_y_q_basic, self.p_model.mv_y_q_scale,
+                                         #self.p_model.y_q_basic, self.p_model.y_q_scale,
+                                        ]
+                disable_modules_list = [
+                                         #self.p_model.mv_y_q_basic, self.p_model.mv_y_q_scale,
+                                         #self.p_model.y_q_basic, self.p_model.y_q_scale,
+                                       ]
+            else:
+                activate_modules_list = [self.p_model]
+                disable_modules_list = [ 
+                                         #self.p_model.mv_y_q_scale,
+                                         #self.p_model.y_q_scale,
+                                       ]
+        else:
+            training_frames = 7
+            activate_modules_list = [self.p_model]
+            disable_modules_list = [ 
+                                     #self.p_model.mv_y_q_scale,
+                                     #self.p_model.y_q_scale,
+                                   ]
+            #disable_modules_list = []
+        
+        self.requires_grad_(False)
+        activate_modules(activate_modules_list)
+        disable_modules(disable_modules_list)
 
-        # I-frame
-        with torch.no_grad():
-            ref_frame, _, self.dpb, _ = self(ref_frame, None, 0)
-
-        reconstructed = ref_frame
-
-        loss_list = []
         dist_list = []
         rate_list = []
         mc_error_list = []
-
-        for frame_idx in range(1, 7):
+        
+        frame_count = 0
+        total_loss = torch.tensor(0., dtype=torch.float, device=batch.device)
+        
+        for frame_idx in range(0, training_frames):
             frame_count += 1
-            ref_frame = reconstructed
-            
-            if epoch < phase['trainAll_fullgop']:
-                ref_frame = ref_frame.detach()
+            if epoch < phase["trainAll_fullgop"] and frame_idx > 0:
+                self.dpb['ref_frame'] = self.dpb['ref_frame'].detach()
+
+            #coding_frames = batch[:, frame_idx].chunk(4, dim=0)
+            #for q_level, coding_frame in zip([0, 1, 2, 3], coding_frames):
 
             coding_frame = batch[:, frame_idx]
 
-            reconstructed, bpp, self.dpb, result = self(coding_frame, self.dpb, frame_idx)
-            reconstructed = reconstructed.clamp(0, 1)
-            self.dpb['ref_frame'] = self.dpb['ref_frame'].clamp(0, 1)
+            rec_frame, bpp, self.dpb, result = self(coding_frame, self.dpb, frame_idx)
 
-            distortion, rate, mc_error = self.criterion(reconstruced, coding_frame).mean(), result['bpp'], result['x2_mse']
+            distortion, rate = result["mse"], result["bpp"]
             
             if self.args.ssim:
                 distortion = (1 - distortion)/64
             
-            loss = self.args.lmda * distortion.mean() + rate.mean() + 0.01 * self.args.lmda * mc_error.mean()
-            loss_list.append(loss)
+            loss = self.args.lmda_scale * self.args.lmda * distortion.mean() + rate.mean()
 
+            total_loss += loss
             dist_list.append(distortion.mean())
             rate_list.append(rate.mean())
-            mc_error_list.append(mc_error.mean())
-
-        loss = torch.mean(torch.tensor(loss_list))
+            #mc_error_list.append(mc_error.mean())
+        
+        total_loss = total_loss / (training_frames - 1)
         distortion = torch.mean(torch.tensor(dist_list))
         rate = torch.mean(torch.tensor(rate_list))
-        mc_error = torch.mean(torch.tensor(mc_error_list))
+        #mc_error = torch.mean(torch.tensor(mc_error_list))
 
         logs = {
-                'train/loss': loss.item(),
+                'train/loss': total_loss.item(),
                 'train/distortion': distortion.item(), 
                 'train/PSNR': mse2psnr(distortion.item()), 
                 'train/rate': rate.item(), 
-                'train/mc_error': mc_error.item(),
+                #'train/mc_error': mc_error.item(),
                }
+        #if epoch <= phase['trainRes_2frames_RecOnly']:
+        #    logs.update({'train/DQ_distortion': DQ_distortion.mean().item()})
 
         self.log_dict(logs)
-
-        return loss 
+        return total_loss 
 
     def validation_step(self, batch, batch_idx):
-        def get_psnr(mse):
-            if mse > 0:
-                psnr = 10 * (torch.log(1 * 1 / mse) / np.log(10))
-            else:
-                psnr = mse + 100
-            return psnr
-
         def create_grid(img):
             return make_grid(torch.unsqueeze(img, 1)).cpu().detach().numpy()[0]
 
@@ -174,49 +248,54 @@ class Pframe(LightningModule):
         rate_list = []
         m_rate_list = []
         loss_list = []
-        align = trc.util.Alignment()
+        align = Alignment()
 
         epoch = int(self.current_epoch)
 
+        self.dpb = None
         for frame_idx in range(gop_size):
             if frame_idx != 0:
                 coding_frame = batch[:, frame_idx]
 
                 rec_frame, bpp, self.dpb, result = self(align.align(coding_frame), self.dpb, frame_idx)
                 rec_frame = align.resume(rec_frame).clamp(0, 1)
-                BDQ = align.resume(result['BDQ']).clamp(0, 1)
+                BDQ = align.resume(result["BDQ"]).clamp(0, 1)
 
-                mse, rate, mc_error = self.criterion(reconstruced, coding_frame).mean().item(), result['bpp'].item(), result['x2_mse'].item()
-                psnr = get_psnr(mse).cpu().item()
-                m_rate = result['bpp_mv_y'].item() + result['bpp_mv_z'].item()
+                mse, rate, mc_error = self.criterion(rec_frame, coding_frame).mean().item(), result["bpp"].item(), result["x2_mse"].item()
+                m_rate = result["bpp_mv_y"].item() + result["bpp_mv_z"].item()
 
 
-                if frame_idx <= 2:
+                #if frame_idx <= 2:
 
-                    flow_hat = align.resume(result['mv_hat'])
-                    flow_rgb = torch.from_numpy(
-                        fz.convert_from_flow(flow_hat[0].permute(1, 2, 0).cpu().numpy()) / 255).permute(2, 0, 1)
-                    upload_img(flow_rgb.cpu().numpy(), f'{seq_name}_{epoch}_dec_flow_{frame_idx}.png', grid=False)
-                    
-                    upload_img(ref_frame.cpu().numpy()[0], f'{seq_name}_{epoch}_ref_frame_{frame_idx}.png', grid=False)
-                    upload_img(coding_frame.cpu().numpy()[0], f'{seq_name}_{epoch}_gt_frame_{frame_idx}.png', grid=False)
-                    upload_img(rec_frame.cpu().numpy()[0], seq_name + '_{:d}_rec_frame_{:d}_{:.3f}.png'.format(epoch, frame_idx, psnr), grid=False)
+                #    flow_hat = align.resume(result["mv_hat"])
+                #    flow_rgb = torch.from_numpy(
+                #        fz.convert_from_flow(flow_hat[0].permute(1, 2, 0).cpu().numpy()) / 255).permute(2, 0, 1)
+                #    upload_img(flow_rgb.cpu().numpy(), f'{seq_name}_{epoch}_dec_flow_{frame_idx}.png', grid=False)
+                #    
+                #    upload_img(ref_frame.cpu().numpy()[0], f'{seq_name}_{epoch}_ref_frame_{frame_idx}.png', grid=False)
+                #    upload_img(coding_frame.cpu().numpy()[0], f'{seq_name}_{epoch}_gt_frame_{frame_idx}.png', grid=False)
+                #    upload_img(rec_frame.cpu().numpy()[0], seq_name + '_{:d}_rec_frame_{:d}_{:.3f}.png'.format(epoch, frame_idx, psnr), grid=False)
 
-                mse = self.criterion(ref_frame, batch[:, frame_idx]).mean().item()
-                psnr = mse2psnr(mse)
-                loss = self.args.lmda * mse + rate + self.args.lmda * 0.01 * mc_error
+                if self.args.ssim:
+                    psnr = mse
+                else:
+                    psnr = mse2psnr(mse)
+                loss = self.args.lmda_scale * self.args.lmda * mse + rate #+ self.args.lmda * 0.01 * mc_error
 
                 m_rate_list.append(m_rate)
             else:
-                rec_frame, rate, self.dpb, _ = self((align.align(batch[:, frame_idx]), None, frame_idx)
+                coding_frame = batch[:, frame_idx]
+                rec_frame, rate, self.dpb, _ = self(align.align(coding_frame), None, frame_idx)
 
                 rec_frame = align.resume(rec_frame).clamp(0, 1)
-                rate = result['bpp'].item()
 
-                mse, rate = self.criterion(reconstruced, coding_frame).mean().item(), result['bpp'].item()
-                psnr = get_psnr(mse).cpu().item()
+                mse, rate = self.criterion(rec_frame, coding_frame).mean().item(), rate.item()
+                if self.args.ssim:
+                    psnr = mse
+                else:
+                    psnr = mse2psnr(mse)
 
-                loss = self.args.lmda * mse + rate
+                loss = self.args.lmda_scale * self.args.lmda * mse + rate
 
             ref_frame = rec_frame
 
@@ -243,30 +322,30 @@ class Pframe(LightningModule):
         rd_dict = {}
         loss = []
 
-        for logs in [log['val_log'] for log in outputs]:
-            dataset_name = logs['dataset_name']
-            seq_name = logs['seq_name']
+        for logs in [log["val_log"] for log in outputs]:
+            dataset_name = logs["dataset_name"]
+            seq_name = logs["seq_name"]
 
             if not (dataset_name in rd_dict.keys()):
                 rd_dict[dataset_name] = {}
-                rd_dict[dataset_name]['psnr'] = []
-                rd_dict[dataset_name]['rate'] = []
-                rd_dict[dataset_name]['m_rate'] = []
+                rd_dict[dataset_name]["psnr"] = []
+                rd_dict[dataset_name]["rate"] = []
+                rd_dict[dataset_name]["m_rate"] = []
 
-            rd_dict[dataset_name]['psnr'].append(logs['val_psnr'])
-            rd_dict[dataset_name]['rate'].append(logs['val_rate'])
-            rd_dict[dataset_name]['m_rate'].append(logs['val_m_rate'])
-   
-            loss.append(logs['val_loss'])
+            rd_dict[dataset_name]["psnr"].append(logs["val_psnr"].cpu().numpy())
+            rd_dict[dataset_name]["rate"].append(logs["val_rate"].cpu().numpy())
+            rd_dict[dataset_name]["m_rate"].append(logs["val_m_rate"].cpu().numpy())
+            
+            loss.append(logs["val_loss"].cpu().numpy())
 
         avg_loss = np.mean(loss)
         
         logs = {'val/loss': avg_loss}
 
         for dataset_name, rd in rd_dict.items():
-            logs['val/'+dataset_name+' psnr'] = np.mean(rd['psnr'])
-            logs['val/'+dataset_name+' rate'] = np.mean(rd['rate'])
-            logs['val/'+dataset_name+' m_rate'] = np.mean(rd['m_rate'])
+            logs["val/'+dataset_name+' psnr"] = np.mean(rd["psnr"])
+            logs["val/'+dataset_name+' rate"] = np.mean(rd["rate"])
+            logs["val/'+dataset_name+' m_rate"] = np.mean(rd["m_rate"])
 
         self.log_dict(logs)
 
@@ -303,7 +382,8 @@ class Pframe(LightningModule):
         BDQ_psnr_list = []
         log_list = []
 
-        align = trc.util.Alignment()
+        align = Alignment()
+        self.dpb = None
 
         os.makedirs(self.args.save_dir + f'/{seq_name}', exist_ok=True)
         os.makedirs(self.args.save_dir + f'/{seq_name}/flow', exist_ok=True)
@@ -313,30 +393,30 @@ class Pframe(LightningModule):
         os.makedirs(self.args.save_dir + f'/{seq_name}/BDQ', exist_ok=True)
 
         for frame_idx in range(gop_size):
-            TO_VISUALIZE = False and frame_id_start == 1 and frame_idx < 8 and seq_name in ['BasketballDrive', 'Kimono1', 'HoneyBee', 'Jockey']
+            TO_VISUALIZE = False and frame_id_start == 1 and frame_idx < 8 and seq_name in ["BasketballDrive', 'Kimono1', 'HoneyBee', 'Jockey"]
 
             if frame_idx != 0:
                 coding_frame = batch[:, frame_idx]
 
                 rec_frame, bpp, self.dpb, result = self(align.align(coding_frame), self.dpb, frame_idx)
                 rec_frame = align.resume(rec_frame).clamp(0, 1)
-                BDQ = align.resume(result['BDQ']).clamp(0, 1)
+                BDQ = align.resume(result["BDQ"]).clamp(0, 1)
 
-                mse, rate, mc_error = self.criterion(reconstruced, coding_frame).mean().item(), result['bpp'].item(), result['x2_mse'].item()
-                psnr = get_psnr(mse).cpu().item()
-                m_rate = result['bpp_mv_y'].item() + result['bpp_mv_z'].item()
+                rate, mc_error = result["bpp"].item(), result["x2_mse"].item()
+                m_rate = result["bpp_mv_y"].item() + result["bpp_mv_z"].item()
 
-                mse = self.criterion(ref_frame, batch[:, frame_idx]).mean().item()
+                mse = self.criterion(rec_frame, batch[:, frame_idx]).mean().item()
                 if self.args.ssim:
                     psnr = mse
                 else:
                     psnr = mse2psnr(mse)
 
-                loss = self.args.lmda * mse + rate + self.args.lmda * 0.01 * mc_error
-
+                loss = self.args.lmda_scale * self.args.lmda * mse + \
+                       rate + \
+                       self.args.lmda_scale * self.args.lmda * 0.01 * mc_error
 
                 if TO_VISUALIZE:
-                    flow_map = plot_flow(data['flow_hat'])
+                    flow_map = plot_flow(data["flow_hat"])
                     save_image(flow_map,
                                self.args.save_dir + f'/{seq_name}/flow/'
                                                     f'frame_{int(frame_id_start + frame_idx)}_flow.png',
@@ -348,41 +428,43 @@ class Pframe(LightningModule):
                     save_image(BDQ[0], self.args.save_dir + f'/{seq_name}/BDQ/'
                                                             f'frame_{int(frame_id_start + frame_idx)}.png')
 
-                metrics['Mo_Rate'].append(m_rate)
+                metrics["Mo_Rate"].append(m_rate)
 
                 BDQ_psnr = mse2psnr(self.criterion(BDQ, coding_frame).mean().item())
-                metrics['BDQ-PSNR'].append(BDQ_psnr)
+                metrics["BDQ-PSNR"].append(BDQ_psnr)
 
                 if frame_idx == 1:
-                    metrics['p1-PSNR'].append(psnr)
-                    metrics['p1-BDQ-PSNR'].append(BDQ_psnr)
+                    metrics["p1-PSNR"].append(psnr)
+                    metrics["p1-BDQ-PSNR"].append(BDQ_psnr)
 
                 log_list.append({'PSNR': psnr, 'Rate': rate,
-                                 'my': result['bpp_mv_y'].item(), 'mz': result['bpp_mv_z'].item(),
-                                 'ry': result['bpp_y'].item(), 'rz': result['bpp_z'].item(),
+                                 'my': result["bpp_mv_y"].item(), 'mz': result["bpp_mv_z"].item(),
+                                 'ry': result["bpp_y"].item(), 'rz': result["bpp_z"].item(),
                                  'BDQ-PSNR': BDQ_psnr})
             else:
-                rec_frame, rate, self.dpb, _ = self((align.align(batch[:, frame_idx]), None, frame_idx)
+                coding_frame = batch[:, frame_idx]
+                rec_frame, rate, self.dpb, _ = self(align.align(coding_frame), None, frame_idx)
+                rate = rate.item()
 
                 rec_frame = align.resume(rec_frame).clamp(0, 1)
-                rate = result['bpp'].item()
 
                 save_image(coding_frame[0], self.args.save_dir + f'/{seq_name}/gt_frame/'
                                                                  f'frame_{int(frame_id_start + frame_idx)}.png')
                 save_image(rec_frame[0], self.args.save_dir + f'/{seq_name}/rec_frame/'
                                                               f'frame_{int(frame_id_start + frame_idx)}.png')
 
-                mse, rate = self.criterion(reconstruced, coding_frame).mean().item(), result['bpp'].item()
-                psnr = get_psnr(mse).cpu().item()
+                mse = self.criterion(rec_frame, coding_frame).mean().item()
+                if self.args.ssim:
+                    psnr = mse
+                else:
+                    psnr = mse2psnr(mse)
 
-                loss = self.args.lmda * mse + rate
+                loss = self.args.lmda_scale * self.args.lmda * mse + rate
 
                 log_list.append({'PSNR': psnr, 'Rate': rate})
 
-            ref_frame = rec_frame
-
-            metrics['PSNR'].append(psnr)
-            metrics['Rate'].append(rate)
+            metrics["PSNR"].append(psnr)
+            metrics["Rate"].append(rate)
 
             frame_id += 1
 
@@ -430,7 +512,7 @@ class Pframe(LightningModule):
         #                             '9299df423938da4fd7f51736070420d2bb39d33972729b46a16180d07262df12']
         #                }
 
-        metrics_name = list(outputs[0]['test_log']['metrics'].keys())  # Get all metrics' names
+        metrics_name = list(outputs[0]["test_log"]["metrics"].keys())  # Get all metrics' names
 
         rd_dict = {}
 
@@ -438,13 +520,13 @@ class Pframe(LightningModule):
         for metrics in metrics_name:
             single_seq_logs[metrics] = {}
 
-        single_seq_logs['LOG'] = {}
-        single_seq_logs['GOP'] = {}  # Will not be printed currently
-        single_seq_logs['Seq_Names'] = []
+        single_seq_logs["LOG"] = {}
+        single_seq_logs["GOP"] = {}  # Will not be printed currently
+        single_seq_logs["Seq_Names"] = []
 
-        for logs in [log['test_log'] for log in outputs]:
-            dataset_name = logs['dataset_name']
-            seq_name = logs['seq_name']
+        for logs in [log["test_log"] for log in outputs]:
+            dataset_name = logs["dataset_name"]
+            seq_name = logs["seq_name"]
 
             if not (dataset_name in rd_dict.keys()):
                 rd_dict[dataset_name] = {}
@@ -452,35 +534,35 @@ class Pframe(LightningModule):
                 for metrics in metrics_name:
                     rd_dict[dataset_name][metrics] = []
 
-            for metrics in logs['metrics'].keys():
-                rd_dict[dataset_name][metrics].append(logs['metrics'][metrics])
+            for metrics in logs["metrics"].keys():
+                rd_dict[dataset_name][metrics].append(logs["metrics"][metrics])
 
             # Initialize
-            if seq_name not in single_seq_logs['Seq_Names']:
-                single_seq_logs['Seq_Names'].append(seq_name)
+            if seq_name not in single_seq_logs["Seq_Names"]:
+                single_seq_logs["Seq_Names"].append(seq_name)
                 for metrics in metrics_name:
                     single_seq_logs[metrics][seq_name] = []
-                single_seq_logs['LOG'][seq_name] = []
-                single_seq_logs['GOP'][seq_name] = []
+                single_seq_logs["LOG"][seq_name] = []
+                single_seq_logs["GOP"][seq_name] = []
 
             # Collect metrics logs
             for metrics in metrics_name:
-                single_seq_logs[metrics][seq_name].append(logs['metrics'][metrics])
-            single_seq_logs['LOG'][seq_name].extend(logs['log_list'])
-            single_seq_logs['GOP'][seq_name] = len(logs['log_list'])
+                single_seq_logs[metrics][seq_name].append(logs["metrics"][metrics])
+            single_seq_logs["LOG"][seq_name].extend(logs["log_list"])
+            single_seq_logs["GOP"][seq_name] = len(logs["log_list"])
 
         os.makedirs(self.args.save_dir + f'/report', exist_ok=True)
 
-        for seq_name, log_list in single_seq_logs['LOG'].items():
+        for seq_name, log_list in single_seq_logs["LOG"].items():
             with open(self.args.save_dir + f'/report/{seq_name}.csv', 'w', newline='') as report:
                 writer = csv.writer(report, delimiter=',')
-                columns = ['frame'] + list(log_list[1].keys())
+                columns = ["frame"] + list(log_list[1].keys())
                 writer.writerow(columns)
 
-                # writer.writerow(['frame', 'PSNR', 'total bits', 'MC-PSNR', 'my', 'mz', 'ry', 'rz', 'MCerr-PSNR'])
+                # writer.writerow(["frame', 'PSNR', 'total bits', 'MC-PSNR', 'my', 'mz', 'ry', 'rz', 'MCerr-PSNR"])
 
                 for idx in range(len(log_list)):
-                    writer.writerow([f'frame_{idx + 1}'] + list(log_list[idx].values()))
+                    writer.writerow([f"frame_{idx + 1}"] + list(log_list[idx].values()))
 
         # Summary
         logs = {}
@@ -489,7 +571,7 @@ class Pframe(LightningModule):
             print_log += '{:>12}'.format(metrics)
         print_log += '\n'
 
-        for seq_name in single_seq_logs['Seq_Names']:
+        for seq_name in single_seq_logs["Seq_Names"]:
             print_log += '{:>16} '.format(seq_name[:5])
 
             for metrics in metrics_name:
@@ -501,7 +583,7 @@ class Pframe(LightningModule):
             print_log += '{:>16} '.format(dataset_name)
 
             for metrics in metrics_name:
-                logs['test/' + dataset_name + ' ' + metrics] = np.mean(rd[metrics])
+                logs["test/" + dataset_name + ' ' + metrics] = np.mean(rd[metrics])
                 print_log += '{:12.4f}'.format(np.mean(rd[metrics]))
 
             print_log += '\n'
@@ -528,8 +610,7 @@ class Pframe(LightningModule):
         lr_gamma = 0.5
         print('lr decay =', lr_gamma, 'lr milestones =', lr_step)
 
-        optimizer = optim.Adam(dict(params=self.p_model.parameters(), lr=self.args.lr),
-                              )
+        optimizer = optim.AdamW([dict(params=self.main_parameters(), lr=self.args.lr)])
         scheduler = optim.lr_scheduler.MultiStepLR(optimizer, lr_step, lr_gamma)
 
         return [optimizer], [scheduler]
@@ -545,8 +626,9 @@ class Pframe(LightningModule):
 
         clip_gradient(optimizer, 5)
 
-        optimizer.step()
+        optimizer.step(closure=optimizer_closure)
         optimizer.zero_grad()
+        #optimizer_closure()
 
     def compress(self, ref_frame, coding_frame, p_order):
         pass
@@ -555,10 +637,11 @@ class Pframe(LightningModule):
         pass
 
     def setup(self, stage):
+
         self.logger.experiment.log_parameters(self.args)
 
-        dataset_root = os.getenv('DATAROOT')
-
+        dataset_root = os.getenv('NEWDATAROOT')
+        
         if stage == 'fit':
             transformer = transforms.Compose([
                 transforms.RandomCrop((256, 256)),
@@ -567,10 +650,10 @@ class Pframe(LightningModule):
             ])
 
             self.train_dataset = VimeoDataset(dataset_root + "vimeo_septuplet/", 7, transform=transformer)
-            self.val_dataset = VideoTestData(dataset_root, self.args.lmda, first_GOP=True)
+            self.val_dataset = VideoTestData(dataset_root + "video_dataset/", {85: 256, 170: 512, 380: 1024, 840: 2048}[self.args.lmda], first_gop=True)
 
         elif stage == 'test':
-            self.test_dataset = VideoTestData(dataset_root, self.args.lmda, sequence=('U'), GOP=self.args.test_GOP)
+            self.test_dataset = VideoTestData(dataset_root + "video_dataset/", {85: 256, 170: 512, 380: 1024, 840: 2048}[self.args.lmda], sequence=('U', 'B'), GOP=self.args.test_GOP)
 
         else:
             raise NotImplementedError
@@ -606,16 +689,15 @@ class Pframe(LightningModule):
         """
         # MODEL specific
         parser = argparse.ArgumentParser(parents=[parent_parser], add_help=False)
+        parser.add_argument('--no_feat_buffer', "-NFB", action="store_true")
         parser.add_argument('--learning_rate', '-lr', dest='lr', default=1e-4, type=float)
         parser.add_argument('--batch_size', default=16, type=int)
-        parser.add_argument('--lmda', default=2048, choices=[256, 512, 1024, 2048, 4096], type=int)
+        parser.add_argument('--lmda', default=840, choices=[85, 170, 380, 840], type=int)
+        parser.add_argument('--lmda_scale', default=1, type=float)
         parser.add_argument('--patch_size', default=256, type=int)
         parser.add_argument('--ssim', action="store_true")
         parser.add_argument('--debug', action="store_true")
-
-        parser.add_argument('--i_frame_q_scale', default=256, type=float)
-        parser.add_argument('--p_frame_y_q_scale', default=256, type=float)
-        parser.add_argument('--p_frame_mv_y_q_scale', default=256, type=float)
+        parser.add_argument('--inter_coder_type', default='CVAE', choices=['CVAE', 'CANF'], type=str)
 
         # training specific (for this model)
         parser.add_argument('--num_workers', default=16, type=int)
@@ -626,8 +708,9 @@ class Pframe(LightningModule):
 if __name__ == '__main__':
     # sets seeds for numpy, torch, etc...
     # must do for DDP to work well
-    seed_everything(888888)
-    torch.backends.cudnn.deterministic = True
+
+    #seed_everything(888888)
+    #torch.backends.cudnn.deterministic = True
 
     save_root = os.getenv('LOG', './') + '/torchDVC/'
 
@@ -640,8 +723,6 @@ if __name__ == '__main__':
     # good practice to define LightningModule speficic params in the module
     parser = Pframe.add_model_specific_args(parser)
 
-    #trc.add_coder_args(parser)
-
     # training specific
     parser.add_argument('--restore', type=str, choices=['none', 'resume', 'load', 'custom', 'finetune'], default='none')
     parser.add_argument('--restore_exp_key', type=str, default=None)
@@ -650,8 +731,6 @@ if __name__ == '__main__':
     parser.add_argument('--test_GOP', type=int, default=32)
     parser.add_argument('--experiment_name', type=str, default='basic')
     parser.add_argument('--project_name', type=str, default="CANFVC_DMC")
-
-    parser.set_defaults(gpus=1)
 
     # parse params
     args = parser.parse_args()
@@ -662,16 +741,17 @@ if __name__ == '__main__':
     checkpoint_callback = ModelCheckpoint(
         save_top_k=-1,
         save_last=True,
-        period=1,
+        every_n_epochs=1, # Save at least every 10 epochs
         verbose=True,
         monitor='val/loss',
         mode='min',
-        prefix=''
+        filename = '{epoch}'
     )
 
     db = None
-    if args.gpus > 1:
-        db = 'ddp'
+    if int(args.devices) > 1:
+        #db = DDPStrategy(process_group_backend="gloo")
+        db = "dp"
 
     comet_logger = CometLogger(
         api_key="bFaTNhLcuqjt1mavz02XPVwN8",
@@ -686,15 +766,19 @@ if __name__ == '__main__':
     
     if args.restore == 'resume' or args.restore == 'finetune':
         trainer = Trainer.from_argparse_args(args,
-                                             checkpoint_callback=checkpoint_callback,
-                                             gpus=args.gpus,
-                                             distributed_backend=db,
+                                             enable_checkpointing=True,
+                                             callbacks=checkpoint_callback,
+                                             accelerator='gpu',
+                                             strategy=db,
                                              logger=comet_logger,
                                              default_root_dir=save_root,
                                              check_val_every_n_epoch=1,
                                              num_sanity_val_steps=0,
+                                             log_every_n_steps=50,
+                                             detect_anomaly=True,
                                              limit_train_batches=0.25,
-                                             terminate_on_nan=True)
+                                             max_epochs=-1
+                                            )
 
         epoch_num = args.restore_exp_epoch
         if args.restore_exp_key is None:
@@ -703,26 +787,29 @@ if __name__ == '__main__':
             checkpoint = torch.load(os.path.join(save_root, project_name, args.restore_exp_key, "checkpoints", f"epoch={epoch_num}.ckpt"),
                                     map_location=(lambda storage, loc: storage))
 
-        if args.restore == 'resume':
-            trainer.current_epoch = epoch_num + 1
-        else:
-            trainer.current_epoch = phase['trainAll_2frames']
+        #if args.restore == 'resume':
+        #    trainer.current_epoch = epoch_num + 1
+        #else:
+        #    trainer.current_epoch = phase["trainAll_2frames"]
 
-        model = Pframe(args).cuda()
-        model.load_state_dict(checkpoint['state_dict'], strict=True)
+        model = Pframe(args)
+        model.load_state_dict(checkpoint["state_dict"], strict=True)
     
     elif args.restore == 'load':
         trainer = Trainer.from_argparse_args(args,
-                                             checkpoint_callback=checkpoint_callback,
-                                             gpus=args.gpus,
-                                             distributed_backend=db,
+                                             enable_checkpointing=True,
+                                             callbacks=checkpoint_callback,
+                                             accelerator='gpu',
+                                             strategy=db,
                                              logger=comet_logger,
                                              default_root_dir=save_root,
                                              check_val_every_n_epoch=1,
                                              num_sanity_val_steps=0,
-                                             limit_train_batches=0.5,
-                                             terminate_on_nan=True)
-
+                                             log_every_n_steps=50,
+                                             detect_anomaly=True,
+                                             limit_train_batches=0.15,
+                                             max_epochs=-1
+                                            )
         
         epoch_num = args.restore_exp_epoch
         if args.restore_exp_key is None:
@@ -732,56 +819,83 @@ if __name__ == '__main__':
                                                  f"epoch={epoch_num}.ckpt"),
                                     map_location=(lambda storage, loc: storage))
 
-        #trainer.current_epoch = phase['trainAll_fullgop'] - 2
-        trainer.current_epoch = epoch_num + 1
-        #trainer.current_epoch = phase['train_aux'] 
+        #trainer.current_epoch = phase["trainAll_fullgop"] - 2
+        #trainer.current_epoch = epoch_num + 1
+        #trainer.current_epoch = phase["train_aux"] 
 
 
-        model = Pframe(args).cuda()
-        model.load_state_dict(checkpoint['state_dict'], strict=True)
+        model = Pframe(args)
+        model.load_state_dict(checkpoint["state_dict"], strict=True)
         #summary(model.Residual.DQ)
     
     elif args.restore == 'custom':
         trainer = Trainer.from_argparse_args(args,
-                                             checkpoint_callback=checkpoint_callback,
-                                             gpus=args.gpus,
-                                             distributed_backend=db,
+                                             enable_checkpointing=True,
+                                             callbacks=checkpoint_callback,
+                                             accelerator='gpu',
+                                             strategy=db,
                                              logger=comet_logger,
                                              default_root_dir=save_root,
                                              check_val_every_n_epoch=1,
-                                             limit_train_batches=0.5,
                                              num_sanity_val_steps=0,
-                                             terminate_on_nan=True)
+                                             log_every_n_steps=50,
+                                             detect_anomaly=True,
+                                             limit_train_batches=0.25,
+                                             max_epochs=-1
+                                            )
         
-        trainer.current_epoch = phase['trainMC']
+        from src.models.video_model import DMC
+        i_frame_q_scales = IntraNoAR.get_q_scales_from_ckpt('./checkpoints/acmmm2022_image_psnr.pth.tar')
+        i_state_dict = get_state_dict('./checkpoints/acmmm2022_image_psnr.pth.tar')
+        p_frame_y_q_scales, p_frame_mv_y_q_scales = DMC.get_q_scales_from_ckpt('./checkpoints/acmmm2022_video_psnr.pth.tar')
+        p_state_dict = get_state_dict('./checkpoints/acmmm2022_video_psnr.pth.tar')
 
         from collections import OrderedDict
         new_ckpt = OrderedDict()
 
-        for k, v in coder_ckpt.items():
-            key = 'if_model.' + k
+        for k, v in i_state_dict.items():
+            key = 'i_model.' + k
             new_ckpt[key] = v
-        
-        for k, v in checkpoint['state_dict'].items():
-            if k.split('.')[0] != 'MCNet' and k.split('.')[0] != 'Residual': 
-                new_ckpt[k] = v
+        for k, v in p_state_dict.items():
+            if k.split('.')[0] == 'contextual_encoder':
+                key = '.'.join(['p_model', 'contextual_coder', 'analysis0', 'model'] + k.split('.')[1:])
+                new_ckpt[key] = v
+                key = '.'.join(['p_model', 'contextual_coder', 'analysis1', 'model'] + k.split('.')[1:])
+                new_ckpt[key] = v
+            elif k.split('.')[0] == 'contextual_decoder':
+                key = '.'.join(['p_model', 'contextual_coder', 'synthesis0', 'model_part1'] + k.split('.')[1:])
+                new_ckpt[key] = v
+                key = '.'.join(['p_model', 'contextual_coder', 'synthesis1', 'model_part1'] + k.split('.')[1:])
+                new_ckpt[key] = v
+            elif k.split('.')[0] == 'recon_generation_net':
+                key = '.'.join(['p_model', 'contextual_coder', 'synthesis0', 'model_part2'] + k.split('.')[1:])
+                new_ckpt[key] = v
+                key = '.'.join(['p_model', 'contextual_coder', 'synthesis1', 'model_part2'] + k.split('.')[1:])
+                new_ckpt[key] = v
+            else:
+                key = 'p_model.' + k
+                new_ckpt[key] = v
 
-   
-        model = Pframe(args).cuda()
-        model.load_state_dict(new_ckpt, strict=False)
-        
+        model = Pframe(args)
+        model.load_state_dict(new_ckpt, strict=True)
+
     else:
         trainer = Trainer.from_argparse_args(args,
-                                             checkpoint_callback=checkpoint_callback,
-                                             gpus=args.gpus,
-                                             distributed_backend=db,
+                                             enable_checkpointing=True,
+                                             callbacks=checkpoint_callback,
+                                             accelerator='gpu',
+                                             strategy=db,
                                              logger=comet_logger,
                                              default_root_dir=save_root,
-                                             check_val_every_n_epoch=3,
-                                             num_sanity_val_steps=-1,
-                                             terminate_on_nan=True)
-    
+                                             check_val_every_n_epoch=1,
+                                             num_sanity_val_steps=0,
+                                             log_every_n_steps=50,
+                                             detect_anomaly=True,
+                                             limit_train_batches=0.1,
+                                             max_epochs=-1
+                                            )
      
+        from src.models.video_model import DMC
         i_frame_q_scales = IntraNoAR.get_q_scales_from_ckpt('./checkpoints/acmmm2022_image_psnr.pth.tar')
         i_state_dict = get_state_dict('./checkpoints/acmmm2022_image_psnr.pth.tar')
         p_frame_y_q_scales, p_frame_mv_y_q_scales = DMC.get_q_scales_from_ckpt('./checkpoints/acmmm2022_video_psnr.pth.tar')
@@ -797,7 +911,11 @@ if __name__ == '__main__':
             key = 'p_model.' + k
             new_ckpt[key] = v
 
-        model = Pframe(args).cuda()
+        new_ckpt['i_model.q_scale'] = i_frame_q_scales.view(4, 1, 1, 1)
+        new_ckpt['p_model.y_q_scale'] = p_frame_y_q_scales.view(4, 1, 1, 1)
+        new_ckpt['p_model.mv_y_q_scale'] = p_frame_mv_y_q_scales.view(4, 1, 1, 1)
+
+        model = Pframe(args)
         model.load_state_dict(new_ckpt, strict=True)
 
         #summary(model.Motion)

@@ -1,5 +1,5 @@
 {
-    "root_path": "/home/mapl119/dataset/TestVideo/video_dataset",
+    "root_path": "/work/tl32rodan/dataset_new/video_dataset",
     "test_classes": {
         "HEVC_B": {
             "test": 0,

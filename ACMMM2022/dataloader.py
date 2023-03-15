@@ -49,6 +49,7 @@ class VimeoDataset(torchData):
         imgs = []
         for f in range(self.frames):
             random.seed(seed)
+            torch.manual_seed(seed)
             raw_path = os.path.join(path, 'im' + str(f + 1) + '.png')
             imgs.append(self.transform(imgloader(raw_path)))
 
@@ -107,7 +108,7 @@ class VideoTestSequence(torchData):
 
 
 class VideoTestData(torchData):
-    def __init__(self, root, lmda, sequence=('U', 'B'), GOP=12):
+    def __init__(self, root, lmda, first_gop=False, sequence=('U', 'B'), GOP=12):
         super(VideoTestData, self).__init__()
         
         assert GOP in [12, 16, 32], ValueError
@@ -184,7 +185,10 @@ class VideoTestData(torchData):
         self.gop_list = []
 
         for seq_name in self.seq_name:
-            gop_num = seq_len[seq_name] // gop_size[seq_name]
+            if first_gop:
+                gop_num = 1
+            else:
+                gop_num = seq_len[seq_name] // gop_size[seq_name]
             for gop_idx in range(gop_num):
                 self.gop_list.append([dataset_name_list[seq_name],
                                       seq_name,

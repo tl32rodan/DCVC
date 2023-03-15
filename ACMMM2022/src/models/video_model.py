@@ -216,9 +216,13 @@ class DMC(CompressionModel):
         self.recon_generation_net = ReconGeneration()
 
         self.mv_y_q_basic = nn.Parameter(torch.ones((1, channel_mv, 1, 1)))
-        self.mv_y_q_scale = nn.Parameter(torch.ones((anchor_num, 1, 1, 1)))
         self.y_q_basic = nn.Parameter(torch.ones((1, channel_M, 1, 1)))
+
+        self.mv_y_q_scale = nn.Parameter(torch.ones((anchor_num, 1, 1, 1)))
         self.y_q_scale = nn.Parameter(torch.ones((anchor_num, 1, 1, 1)))
+
+        #self.mv_y_q_scale = nn.Parameter(torch.Tensor([1.184, 1.104, 1.011, 0.919]).view(4, 1, 1, 1))
+        #self.y_q_scale = nn.Parameter(torch.Tensor([1.238, 0.962, 0.713, 0.532]).view(4, 1, 1, 1))
         self.anchor_num = int(anchor_num)
 
         self._initialize_weights()
@@ -506,6 +510,8 @@ class DMC(CompressionModel):
                 "bit_z": bit_z,
                 "bit_mv_y": bit_mv_y,
                 "bit_mv_z": bit_mv_z,
+                "BDQ": torch.zeros_like(ref_frame),
+                "x2_mse": torch.zeros_like(me_mse),
                 }
 
     def forward(self, x, dpb, mv_y_q_scale=None, y_q_scale=None):
@@ -553,6 +559,9 @@ class ContextualCANFMainCoder(nn.Module):
             self.add_module('analysis'+str(i), ContextualCondANFAnalysisTransform(channel_N, channel_M))
             self.add_module('synthesis'+str(i), ContextualCondANFSynthesisTransform(channel_N, channel_M))
 
+    def __getitem__(self, key):
+        return self.__getattr__(key)
+
     def encode(self, input, context, code=None, jac=None):
         for i in range(self.num_layers):
             _, code, jac = self['analysis'+str(i)](input, context, code, jac)
@@ -578,11 +587,12 @@ class CANFVC_DMC(DMC):
         
         self.__delattr__('contextual_encoder')
         self.__delattr__('contextual_decoder')
+        self.__delattr__('recon_generation_net')
 
         self.contextual_coder = ContextualCANFMainCoder(2, channel_N=self.channel_N, channel_M=self.channel_M)
+        self._initialize_weights()
         self.DQ = DeQuantizationModule(3, 3, 64, 6)
 
-        self._initialize_weights()
 
     def compress(self, x, dpb, mv_y_q_scale, y_q_scale):
         # pic_width and pic_height may be different from x's size. x here is after padding
@@ -610,7 +620,7 @@ class CANFVC_DMC(DMC):
         
         #####################
         #y = self.contextual_encoder(x, context1, context2, context3)
-        _, y, _ = self.contextual.encode(x, list(context1, context2, context3))
+        _, y, _ = self.contextual.encode(x, [context1, context2, context3])
         #####################
         y = y / curr_y_q
         z = self.contextual_hyper_prior_encoder(y)
@@ -630,7 +640,7 @@ class CANFVC_DMC(DMC):
         #####################
         #recon_image_feature = self.contextual_decoder(y_hat, context2, context3)
         #feature, x_hat = self.recon_generation_net(recon_image_feature, context1)
-        x_hat, _, _ = self.contextual_coder.decode(torch.zeros_like(dpb["ref_frame"]), list(context1, context2, context3), y_hat)
+        x_hat, _, _ = self.contextual_coder.decode(torch.zeros_like(dpb["ref_frame"]), [context1, context2, context3], y_hat)
         x_hat = self.DQ(x_hat)
         #####################
 
@@ -695,7 +705,7 @@ class CANFVC_DMC(DMC):
         #####################
         #recon_image_feature = self.contextual_decoder(y_hat, context2, context3)
         #feature, recon_image = self.recon_generation_net(recon_image_feature, context1)
-        x_hat, _, _ = self.contextual_coder.decode(torch.zeros_like(dpb["ref_frame"]), list(context1, context2, context3), y_hat)
+        x_hat, _, _ = self.contextual_coder.decode(torch.zeros_like(dpb["ref_frame"]), [context1, context2, context3], y_hat)
         recon_image = self.DQ(x_hat)
         #####################
 
@@ -735,7 +745,7 @@ class CANFVC_DMC(DMC):
 
         #####################
         #y = self.contextual_encoder(x, context1, context2, context3)
-        x1, y, _ = self.contextual.encode(x, list(context1, context2, context3))
+        x1, y, _ = self.contextual_coder.encode(x, [context1, context2, context3])
         #####################
 
         y = y / curr_y_q
@@ -756,7 +766,7 @@ class CANFVC_DMC(DMC):
         #####################
         #recon_image_feature = self.contextual_decoder(y_hat, context2, context3)
         #feature, recon_image = self.recon_generation_net(recon_image_feature, context1)
-        x_hat, _, _ = self.contextual_coder.decode(torch.zeros_like(dpb["ref_frame"]), list(context1, context2, context3), y_hat)
+        x_hat, _, _ = self.contextual_coder.decode(torch.zeros_like(dpb["ref_frame"]), [context1, context2, context3], y_hat)
         recon_image = self.DQ(x_hat)
         #####################
 
@@ -770,8 +780,8 @@ class CANFVC_DMC(DMC):
 
         #####################
         # Last layer during forwarding
-        x2, _, _ = self.contextual['synthesis'+str(self.contextual.num_layers - 1)](
-                       x1, list(context1, context2, context3), y_hat
+        x2, _, _ = self.contextual_coder['synthesis'+str(self.contextual_coder.num_layers - 1)](
+                       x1, [context1, context2, context3], y_hat
                    )
         x2_mse = self.mse(x2, torch.zeros_like(x2))
         x2_mse = torch.sum(x2_mse, dim=(1, 2, 3)) / pixel_num

@@ -39,7 +39,9 @@ class IntraNoAR(CompressionModel):
         )
 
         self.q_basic = nn.Parameter(torch.ones((1, N, 1, 1)))
-        self.q_scale = nn.Parameter(torch.ones((anchor_num, 1, 1, 1)))
+        #self.q_scale = nn.Parameter(torch.ones((anchor_num, 1, 1, 1)))
+        self.q_scale = nn.Parameter(torch.Tensor([1.541, 1.083, 0.729, 0.500]).view(4, 1, 1, 1))
+
         # the exact q_step is q_basic * q_scale
         self.N = int(N)
         self.anchor_num = int(anchor_num)
